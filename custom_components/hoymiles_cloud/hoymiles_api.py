@@ -178,6 +178,13 @@ class HoymilesAPI:
         self._live_locks: dict[str, asyncio.Lock] = {}
         self._authentication_lock = asyncio.Lock()
         self._battery_write_locks: dict[str, asyncio.Lock] = {}
+        # Settings reads are asynchronous cloud jobs.  Keep the job id when the
+        # plant has not finished it yet instead of submitting a new read on the
+        # next coordinator refresh.  The cloud can take several minutes to
+        # complete these jobs; resubmitting every few minutes creates a backlog.
+        self._pending_settings_reads: dict[tuple[str, int], str] = {}
+        # Battery and relay reads share one asynchronous settings queue per station.
+        self._settings_read_locks: dict[str, asyncio.Lock] = {}
 
     def _battery_write_lock(self, station_id: str) -> asyncio.Lock:
         """Serialize read-modify-write commands for one station only."""
@@ -1607,58 +1614,100 @@ class HoymilesAPI:
 
         return latest_module_values(chart, now=now)
 
+    async def _read_settings_job(
+        self,
+        station_id: str,
+        action_id: int,
+        empty_builder: Any,
+        parser: Any,
+        label: str,
+    ) -> dict[str, Any]:
+        """Read settings without creating duplicate long-running cloud jobs.
+
+        Hoymiles returns a job id for settings reads. A job can remain in
+        ``code: 2`` (running) for several minutes. Keep the original job id
+        and resume polling it on the next refresh instead of submitting a
+        second job. Battery and relay reads are also serialized because they
+        share the station's asynchronous settings command queue.
+        """
+        key = (str(station_id), action_id)
+        read_lock = self._settings_read_locks.setdefault(str(station_id), asyncio.Lock())
+
+        async with read_lock:
+            command_id = self._pending_settings_reads.get(key)
+            try:
+                if command_id is None:
+                    await self._ensure_authenticated()
+                    response = await self._submit_battery_settings_command(
+                        API_BATTERY_SETTINGS_READ_URL,
+                        {
+                            "action": action_id,
+                            "data": {"sid": int(station_id)},
+                        },
+                        log_label=f"{label} for station {station_id}",
+                    )
+                    data = response.get("data") if isinstance(response, dict) else None
+                    if isinstance(data, (str, int)):
+                        command_id = str(data)
+                        self._pending_settings_reads[key] = command_id
+                    else:
+                        self._pending_settings_reads.pop(key, None)
+                        return parser(response)
+
+                response = await self._poll_battery_settings_status(
+                    command_id,
+                    command_label=f"{label} for station {station_id}",
+                    max_polls=10,
+                )
+                response_data = response.get("data", {}) if isinstance(response, dict) else {}
+                running = (
+                    isinstance(response_data, dict)
+                    and response_data.get("code") == BATTERY_SETTINGS_STATUS_RUNNING
+                )
+                if running:
+                    # Keep the job id. The next coordinator refresh will poll
+                    # the same job instead of submitting another one.
+                    message = (
+                        response_data.get("message")
+                        or f"{label} pending, please wait."
+                    )
+                    return empty_builder(message=message)
+
+                self._pending_settings_reads.pop(key, None)
+                return parser(response)
+            except json.JSONDecodeError as err:
+                self._pending_settings_reads.pop(key, None)
+                _LOGGER.warning("Error decoding %s JSON: %s", label, err)
+                return empty_builder(message=f"Invalid {label} response")
+            except Exception as err:
+                # A transport timeout does not mean that the cloud job
+                # disappeared. Preserve the job id so a subsequent refresh can
+                # resume it.
+                _LOGGER.warning(
+                    "Error checking %s status: %s", label, type(err).__name__
+                )
+                return empty_builder(message=f"Unable to read {label}")
+
+
     async def get_battery_settings(self, station_id: str) -> Dict[str, Any]:
         """Get battery settings for a station."""
-        if self.is_token_expired():
-            await self._ensure_authenticated()
-        try:
-            response = await self._submit_battery_settings_command(
-                API_BATTERY_SETTINGS_READ_URL,
-                {
-                    "action": BATTERY_SETTINGS_ACTION_ID,
-                    "data": {"sid": int(station_id)},
-                },
-                log_label=f"battery settings read for station {station_id}",
-            )
-            final_response = await self._resolve_battery_settings_command(
-                response,
-                expect_result=True,
-                command_label=f"battery settings read for station {station_id}",
-            )
-        except json.JSONDecodeError as err:
-            _LOGGER.warning("Error decoding battery settings JSON: %s", err)
-            return build_empty_battery_settings(message="Invalid battery settings response")
-        except Exception as err:
-            _LOGGER.warning("Error checking battery settings status: %s", err)
-            return build_empty_battery_settings(message="Unable to read battery settings")
-
-        return self._parse_battery_settings_response(final_response)
+        return await self._read_settings_job(
+            station_id,
+            BATTERY_SETTINGS_ACTION_ID,
+            build_empty_battery_settings,
+            self._parse_battery_settings_response,
+            "battery settings",
+        )
 
     async def get_relay_settings(self, station_id: str) -> dict[str, Any]:
         """Get relay / dry-contact settings for a station."""
-        await self._ensure_authenticated()
-        try:
-            response = await self._submit_battery_settings_command(
-                API_BATTERY_SETTINGS_READ_URL,
-                {
-                    "action": RELAY_SETTINGS_ACTION_ID,
-                    "data": {"sid": int(station_id)},
-                },
-                log_label=f"relay settings read for station {station_id}",
-            )
-            final_response = await self._resolve_battery_settings_command(
-                response,
-                expect_result=True,
-                command_label=f"relay settings read for station {station_id}",
-            )
-        except json.JSONDecodeError as err:
-            _LOGGER.warning("Error decoding relay settings JSON: %s", err)
-            return build_empty_relay_settings(message="Invalid relay settings response")
-        except Exception as err:
-            _LOGGER.warning("Error checking relay settings status: %s", err)
-            return build_empty_relay_settings(message="Unable to read relay settings")
-
-        return self._parse_relay_settings_response(final_response)
+        return await self._read_settings_job(
+            station_id,
+            RELAY_SETTINGS_ACTION_ID,
+            build_empty_relay_settings,
+            self._parse_relay_settings_response,
+            "relay settings",
+        )
 
     def _default_mode_settings(self, mode: int) -> dict[str, Any]:
         """Return default settings for a battery mode."""
@@ -1717,9 +1766,16 @@ class HoymilesAPI:
         command_id: str,
         *,
         command_label: str,
+        max_polls: int = BATTERY_SETTINGS_MAX_POLLS,
     ) -> dict[str, Any]:
-        """Poll the battery settings status endpoint until completion."""
-        for attempt in range(BATTERY_SETTINGS_MAX_POLLS):
+        """Poll the battery settings status endpoint until completion.
+
+        ``max_polls`` is deliberately bounded per invocation.  For reads, the
+        caller retains the job id when the cloud is still working, allowing the
+        next refresh to continue the same job without blocking Home Assistant
+        for minutes.
+        """
+        for attempt in range(max_polls):
             response = await self._submit_battery_settings_command(
                 API_BATTERY_SETTINGS_STATUS_URL,
                 {"id": str(command_id)},

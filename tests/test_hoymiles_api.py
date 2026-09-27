@@ -714,6 +714,36 @@ def _async_write_job(ok: bool = True) -> list[dict]:
     ]
 
 
+def test_settings_read_keeps_pending_job_across_calls() -> None:
+    """A slow settings job must not be replaced by a second read job."""
+    session = FakeSession(
+        [
+            # First call creates a job and sees it still running for all polls.
+            {"status": "0", "message": "success", "data": "slow-read"},
+        ]
+        + [
+            {"status": "0", "message": "success", "data": {"code": 2, "data": [], "message": "pending"}}
+        ] * hoymiles_api_module.BATTERY_SETTINGS_MAX_POLLS
+        + [
+            # Second call must poll the original job; it must NOT submit another
+            # action-1013 read command first.
+            {"status": "0", "message": "success", "data": {"code": 0, "data": {"mode": 1, "data": {"k_1": {"reserve_soc": 10}}}}},
+        ]
+    )
+    api = HoymilesAPI(session, "user@example.com", "secret")
+    api._token = "token"
+    api._token_expires_at = 9999999999
+
+    first = asyncio.run(api.get_battery_settings("123"))
+    assert first["readable"] is False
+    assert api._pending_settings_reads[("123", hoymiles_api_module.BATTERY_SETTINGS_ACTION_ID)] == "slow-read"
+
+    second = asyncio.run(api.get_battery_settings("123"))
+    assert second["readable"] is True
+    assert ("123", hoymiles_api_module.BATTERY_SETTINGS_ACTION_ID) not in api._pending_settings_reads
+    assert len(session.requests) == 1 + hoymiles_api_module.BATTERY_SETTINGS_MAX_POLLS + 1
+
+
 def test_battery_write_prefers_the_documented_async_job_flow() -> None:
     """The documented action-1013 flow must be tried before the direct endpoint.
 
